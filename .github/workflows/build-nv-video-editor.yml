@@ -1,0 +1,292 @@
+name: Build NV Video Editor (Windows 10/11 x64)
+
+# Builds the open-source Concat video editor (https://github.com/jub0t/Concat,
+# AGPL-3.0-or-later) from source on a Windows runner and packages it as
+# "NV Video Editor" for a 64-bit Windows PC.
+#
+# Output (one downloadable artifact called NV-Video-Editor-windows-x64):
+#   - NV-Video-Editor-<version>-windows-x86_64-setup.exe   installer
+#   - NV-Video-Editor-<version>-windows-x64.zip            portable folder,
+#                                                          run "NV Video Editor.exe"
+#
+# Everything below is taken from Concat's own .github/workflows/build-app.yml
+# (Windows x86_64 row), cut down to that one target. Only these things differ:
+#   - the window title is changed to "NV Video Editor"
+#   - the program is shipped as "NV Video Editor.exe"
+#   - the installer has its own name, folder, Start-menu entry and AppId, so it
+#     installs beside an official Concat instead of replacing it
+#   - no code signing, no .msi, no Intel-emulator smoke test or ISA scan
+#
+# Run it from the Actions tab: "Build NV Video Editor" -> "Run workflow".
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Concat branch, tag or commit to build (empty = its default branch)
+        type: string
+        default: ""
+
+env:
+  CARGO_TERM_COLOR: always
+  ORT_VERSION: 1.28.0
+  # whisper.cpp's CPU kernels: one module per x86_64 generation, picked at
+  # run time, so the build runs on any CPU and is fast on newer ones.
+  GGML_NATIVE: "OFF"
+  GGML_BACKEND_DL: "ON"
+  GGML_CPU_ALL_VARIANTS: "ON"
+  GGML_AVX2: "OFF"
+  GGML_FMA: "OFF"
+  GGML_F16C: "OFF"
+  GGML_BMI2: "OFF"
+  TARGET: x86_64-pc-windows-msvc
+
+jobs:
+  windows:
+    name: windows-x86_64
+    runs-on: windows-2022
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: jub0t/Concat
+          ref: ${{ inputs.ref }}
+
+      - name: The pinned toolchain
+        id: toolchain
+        shell: bash
+        run: echo "channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' src/rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (v1), 2026-10-09
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+
+      - name: Read the version
+        id: version
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' src/Cargo.toml | head -1)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "Building Concat $version as NV Video Editor"
+
+      # ── Rename ─────────────────────────────────────────────────────────
+      # The window's title (the taskbar and Alt-Tab name) and the title of the
+      # start-up error box. Only the first has to change, so only it is checked.
+      - name: Rename the window to NV Video Editor
+        shell: bash
+        run: |
+          set -euo pipefail
+          sed -i 's/title: "Concat";/title: "NV Video Editor";/' src/crates/concat/ui/app.slint
+          grep -q 'title: "NV Video Editor";' src/crates/concat/ui/app.slint \
+            || { echo "::error::could not change the window title in app.slint"; exit 1; }
+          sed -i 's/\.set_title("Concat")/.set_title("NV Video Editor")/' src/crates/concat/src/platform.rs
+
+      # ── Dependencies (same pins as Concat's own build) ─────────────────
+      - name: FFmpeg development libraries and LLVM
+        timeout-minutes: 15
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $bash = "$env:ProgramFiles\Git\bin\bash.exe"
+          & $bash scripts/ci/fetch.sh "llvm-win64" llvm.exe
+          if ($LASTEXITCODE -ne 0) { throw "the LLVM download failed" }
+          Start-Process -Wait -FilePath .\llvm.exe -ArgumentList "/S", "/D=C:\llvm"
+          if (-not (Test-Path C:\llvm\bin\libclang.dll)) { throw "LLVM did not install to C:\llvm" }
+          Remove-Item llvm.exe -ErrorAction SilentlyContinue
+          "C:\llvm\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          "LIBCLANG_PATH=C:\llvm\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
+          & $bash scripts/ci/fetch.sh "ffmpeg-win64" ffmpeg-win.zip
+          if ($LASTEXITCODE -ne 0) { throw "the FFmpeg download failed" }
+          Expand-Archive ffmpeg-win.zip -DestinationPath ffdl
+          $dir = (Get-ChildItem ffdl -Directory | Select-Object -First 1).FullName
+          "FFMPEG_DIR=$dir" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$dir\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: ONNX Runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          & "$env:ProgramFiles\Git\bin\bash.exe" scripts/ci/fetch.sh "onnxruntime-win-x64" onnxruntime.zip
+          if ($LASTEXITCODE -ne 0) { throw "the ONNX Runtime download failed" }
+          Expand-Archive onnxruntime.zip -DestinationPath .
+          $dir = "$PWD\onnxruntime-win-x64-$env:ORT_VERSION"
+          if (-not (Test-Path "$dir\lib\onnxruntime.lib")) { throw "$dir\lib\onnxruntime.lib is not there" }
+          if (-not (Test-Path "$dir\lib\onnxruntime.dll")) { throw "$dir\lib\onnxruntime.dll is not there" }
+          "ORT_LIB_LOCATION=$dir\lib" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "ORT_PREFER_DYNAMIC_LINK=1" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "ORT_DIR=$dir" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$dir\lib" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: sherpa-onnx shared libraries
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = (Select-String -Path src\Cargo.lock -Pattern 'name = "sherpa-onnx-sys"' -Context 0,1).Context.PostContext[0] -replace '.*"(.*)".*', '$1'
+          $name = "sherpa-onnx-win-x64-shared-MT-Release-lib"
+          $stem = "sherpa-onnx-v$version-win-x64-shared-MT-Release-lib"
+          $bash = "$env:ProgramFiles\Git\bin\bash.exe"
+          $url = & $bash scripts/ci/fetch.sh --url $name
+          if ($url -notmatch "/v$([regex]::Escape($version))/") { throw "scripts/ci/deps.lock pins $name for another version than Cargo.lock's $version" }
+          Write-Host "Downloading $stem"
+          & $bash scripts/ci/fetch.sh $name sherpa.tar.bz2
+          if ($LASTEXITCODE -ne 0) { throw "the sherpa-onnx download failed" }
+          Write-Host "Unpacking"
+          python -c "import tarfile; t = tarfile.open('sherpa.tar.bz2'); t.extractall(**({'filter': 'data'} if hasattr(tarfile, 'data_filter') else {}))"
+          if (-not (Test-Path "$stem\lib")) { throw "$stem\lib is not there after unpacking" }
+          New-Item -ItemType Directory -Force sherpa-libs, sherpa-dlls | Out-Null
+          Copy-Item "$stem\lib\sherpa-onnx-*.lib" sherpa-libs\
+          Copy-Item "$stem\lib\sherpa-onnx-*.dll" sherpa-dlls\
+          "SHERPA_ONNX_LIB_DIR=$PWD\sherpa-libs" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "SHERPA_DLL_DIR=$PWD\sherpa-dlls" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      # ── Build ──────────────────────────────────────────────────────────
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: src
+          key: ${{ env.TARGET }}
+          env-vars: CARGO CC CFLAGS CXX CMAKE RUST GGML ORT
+
+      - name: Build
+        timeout-minutes: 90
+        shell: bash
+        working-directory: src
+        run: |
+          set -o pipefail
+          cargo build --profile app -p concat --target "$TARGET" 2>&1 | tee build.log
+
+      - name: Build log to the summary (failure only)
+        if: failure()
+        shell: bash
+        run: |
+          if [ -f src/build.log ]; then
+            {
+              echo "### Build failed"
+              echo '```'
+              tail -n 150 src/build.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # ── Package ────────────────────────────────────────────────────────
+      - name: Stage the folder
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          COMMIT: ${{ steps.version.outputs.commit }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $dir = "stage\NV-Video-Editor"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Copy-Item "src\target\$env:TARGET\app\concat.exe" $dir
+          Copy-Item "$env:FFMPEG_DIR\bin\*.dll" $dir
+          Copy-Item "$env:SHERPA_DLL_DIR\*.dll" $dir
+          Copy-Item "$env:ORT_DIR\lib\*.dll" $dir
+          # whisper's DLLs and its CPU modules (see the env block above).
+          $built = Get-ChildItem "src\target\$env:TARGET\app\build\whisper-rs-sys-*\out\bin\ggml-cpu-x64.dll" |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $built) { throw "whisper-rs-sys installed no ggml-cpu-x64.dll" }
+          Write-Host "whisper's build: $($built.DirectoryName)"
+          Copy-Item "$($built.DirectoryName)\whisper.dll", "$($built.DirectoryName)\ggml*.dll" $dir
+          foreach ($module in "x64", "sandybridge", "haswell") {
+            if (-not (Test-Path "$dir\ggml-cpu-$module.dll")) { throw "ggml-cpu-$module.dll is missing from the build" }
+          }
+          Copy-Item LICENSE, THIRD_PARTY_NOTICES.md $dir
+          # AGPL: say what this is and where its source is.
+          @"
+          NV Video Editor is a build of Concat $env:VERSION, a free and open-source
+          video editor licensed under AGPL-3.0-or-later.
+          Source: https://github.com/jub0t/Concat   (commit $env:COMMIT)
+          Changes in this build: the window title and the program's file name.
+          "@ | Set-Content "$dir\ABOUT-THIS-BUILD.txt"
+          # The Visual C++ runtime DLLs anything in the folder imports.
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -property installationPath
+          $crt = Get-ChildItem "$vs\VC\Redist\MSVC\*\x64\Microsoft.VC14*.CRT" -Directory |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $crt) { throw "no Visual C++ redistributable folder for x64 under $vs" }
+          $dumpbin = & $vswhere -latest -products * -find "VC\Tools\MSVC\**\bin\Host*\*\dumpbin.exe" | Select-Object -First 1
+          foreach ($pass in 1, 2) {
+            foreach ($pe in Get-ChildItem $dir -File -Include *.exe, *.dll -Recurse) {
+              foreach ($line in & $dumpbin /nologo /dependents $pe.FullName) {
+                $dll = $line.Trim()
+                if ($dll -match "\.dll$" -and (Test-Path "$($crt.FullName)\$dll") -and -not (Test-Path "$dir\$dll")) {
+                  Write-Host "$($pe.Name) imports $dll; copying it from $($crt.FullName)"
+                  Copy-Item "$($crt.FullName)\$dll" $dir
+                }
+              }
+            }
+          }
+          Get-ChildItem $dir | Format-Table Name, Length
+
+      # Launches the folder with only Windows on the path and fails if the
+      # program does not start. Runs before the rename: the script looks for
+      # concat.exe.
+      - name: Smoke test
+        timeout-minutes: 15
+        shell: pwsh
+        run: scripts/ci/smoke-windows.ps1 -Bundle "stage\NV-Video-Editor"
+
+      - name: Name the program NV Video Editor.exe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Rename-Item "stage\NV-Video-Editor\concat.exe" "NV Video Editor.exe"
+          if (-not (Test-Path "stage\NV-Video-Editor\NV Video Editor.exe")) { throw "the rename did not work" }
+
+      - name: Portable zip
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force out | Out-Null
+          Compress-Archive -Path "stage\NV-Video-Editor" -DestinationPath "out\NV-Video-Editor-$env:VERSION-windows-x64.zip"
+          Get-ChildItem out | Format-Table Name, Length
+
+      # The installer is a bonus: if Inno Setup trips, the zip above is still
+      # published. Concat's script is edited in place (its paths are relative to
+      # it): new name, folder, shortcuts and AppId, and "NV Video Editor.exe" in
+      # place of concat.exe.
+      - name: Installer
+        continue-on-error: true
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $iss = "assets\windows\concat.iss"
+          $text = Get-Content $iss -Raw
+          $pairs = @(
+            @('{app}\concat.exe',                    '{app}\NV Video Editor.exe'),
+            @('AppName=Concat',                      'AppName=NV Video Editor'),
+            @('AppVerName=Concat ',                  'AppVerName=NV Video Editor '),
+            @('DefaultDirName={autopf}\Concat',      'DefaultDirName={autopf}\NV Video Editor'),
+            @('DefaultGroupName=Concat',             'DefaultGroupName=NV Video Editor'),
+            @('OutputBaseFilename=Concat-',          'OutputBaseFilename=NV-Video-Editor-'),
+            @('UninstallDisplayName=Concat',         'UninstallDisplayName=NV Video Editor'),
+            @('{autoprograms}\Concat',               '{autoprograms}\NV Video Editor'),
+            @('{autodesktop}\Concat',                '{autodesktop}\NV Video Editor'),
+            @('LaunchProgram,Concat',                'LaunchProgram,NV Video Editor'),
+            @('7B1E5C3A-3B9E-4F0B-9C6D-2F1D0C0A0C47', 'C4A1D7E2-5F3B-4B8A-9E61-0D2A7B9F3E15')
+          )
+          foreach ($pair in $pairs) {
+            if (-not $text.Contains($pair[0])) { throw "concat.iss no longer contains: $($pair[0])" }
+            $text = $text.Replace($pair[0], $pair[1])
+          }
+          Set-Content $iss $text -NoNewline
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            Write-Host "Installing Inno Setup"
+            choco install innosetup --no-progress -y | Out-Null
+          }
+          if (-not (Test-Path $iscc)) { throw "Inno Setup is not at $iscc" }
+          & $iscc "/DVersion=$env:VERSION" "/DArch=x64compatible" "/DSuffix=x86_64" `
+            "/DStage=$PWD\stage\NV-Video-Editor" "/DOut=$PWD\out" $iss
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed with $LASTEXITCODE" }
+          Get-ChildItem out | Format-Table Name, Length
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: NV-Video-Editor-windows-x64
+          path: out/*
+          if-no-files-found: error
